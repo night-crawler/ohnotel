@@ -1,12 +1,61 @@
-use crate::atomic::{AtomicMeasure, AtomicNumOps};
-use opentelemetry_proto::tonic::common::v1 as pb;
 use ordered_float::OrderedFloat;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+macro_rules! impl_from {
+    ($target:ty; $($source:ty => |$param:ident| $body:expr),+ $(,)?) => {
+        $(
+            impl From<$source> for $target {
+                #[inline]
+                fn from($param: $source) -> Self {
+                    $body
+                }
+            }
+        )+
+    };
+}
+
+macro_rules! impl_value_string_from {
+    ($($source:ty),+ $(,)?) => {
+        $(
+            impl From<$source> for Value {
+                #[inline]
+                fn from(value: $source) -> Self {
+                    Self::String(Str::from(value))
+                }
+            }
+        )+
+    };
+}
+
+macro_rules! impl_value_int_from {
+    ($($source:ty),+ $(,)?) => {
+        $(
+            impl From<$source> for Value {
+                #[inline]
+                fn from(value: $source) -> Self {
+                    Self::Int(i64::from(value))
+                }
+            }
+        )+
+    };
+}
+
+macro_rules! impl_value_double_from {
+    ($($source:ty => $convert:expr),+ $(,)?) => {
+        $(
+            impl From<$source> for Value {
+                #[inline]
+                fn from(value: $source) -> Self {
+                    Self::Double(OrderedFloat::from($convert(value)))
+                }
+            }
+        )+
+    };
+}
 
 #[derive(Debug, Clone)]
 pub enum Str {
@@ -14,35 +63,18 @@ pub enum Str {
     ArcStr(Arc<str>),
 }
 
-impl From<&'static str> for Str {
-    fn from(value: &'static str) -> Self {
-        Self::Cow(Cow::Borrowed(value))
-    }
-}
+impl_from!(Str;
+    &'static str => |value| Self::Cow(Cow::Borrowed(value)),
+    String => |value| Self::Cow(Cow::Owned(value)),
+    Arc<str> => |value| Self::ArcStr(value),
+    &Arc<str> => |value| Self::ArcStr(Arc::clone(value)),
+    Cow<'static, str> => |value| Self::Cow(value),
 
-impl From<String> for Str {
-    fn from(value: String) -> Self {
-        Self::Cow(Cow::Owned(value))
-    }
-}
-
-impl From<Arc<str>> for Str {
-    fn from(value: Arc<str>) -> Self {
-        Self::ArcStr(value)
-    }
-}
-
-impl From<&Arc<str>> for Str {
-    fn from(value: &Arc<str>) -> Self {
-        Self::ArcStr(Arc::clone(value))
-    }
-}
-
-impl From<Cow<'static, str>> for Str {
-    fn from(value: Cow<'static, str>) -> Self {
-        Self::Cow(value)
-    }
-}
+    &String => |value| Self::Cow(Cow::Owned(value.clone())),
+    &Str => |value| value.clone(),
+    &Cow<'static, str> => |value| Self::Cow(value.clone()),
+    Box<str> => |value| Self::Cow(Cow::Owned(value.into_string())),
+);
 
 impl Str {
     #[inline]
@@ -74,6 +106,12 @@ impl PartialEq for Str {
     }
 }
 
+impl Display for Str {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl Eq for Str {}
 
 impl PartialOrd for Str {
@@ -95,6 +133,7 @@ impl Ord for Str {
 }
 
 impl Hash for Str {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_str().hash(state);
     }
@@ -111,51 +150,98 @@ pub enum Value {
     Bytes(Vec<u8>),
 }
 
-impl From<&'static str> for Value {
-    fn from(value: &'static str) -> Self {
-        Self::String(Str::from(value))
+impl_value_string_from!(
+    &'static str,
+    String,
+    &String,
+    Arc<str>,
+    &Arc<str>,
+    Cow<'static, str>,
+    &Cow<'static, str>,
+    Box<str>,
+    Str,
+    &Str,
+);
+
+impl_from!(Value;
+    bool => |value| Self::Bool(value),
+    OrderedFloat<f64> => |value| Self::Double(value),
+
+    Vec<Value> => |value| Self::ArrayAny(value),
+    &[Value] => |value| Self::ArrayAny(value.to_vec()),
+
+    Vec<KeyValue> => |value| Self::ArrayKv(value),
+    &[KeyValue] => |value| Self::ArrayKv(value.to_vec()),
+
+    Vec<u8> => |value| Self::Bytes(value),
+    &[u8] => |value| Self::Bytes(value.to_vec()),
+    Box<[u8]> => |value| Self::Bytes(value.into_vec()),
+);
+
+impl<const N: usize> From<[Value; N]> for Value {
+    #[inline]
+    fn from(value: [Value; N]) -> Self {
+        Self::ArrayAny(Vec::from(value))
     }
 }
 
-impl From<String> for Value {
-    fn from(value: String) -> Self {
-        Self::String(Str::from(value))
+impl<const N: usize> From<&[Value; N]> for Value {
+    #[inline]
+    fn from(value: &[Value; N]) -> Self {
+        Self::ArrayAny(value.to_vec())
     }
 }
 
-impl From<Arc<str>> for Value {
-    fn from(value: Arc<str>) -> Self {
-        Self::String(Str::from(value))
+impl<const N: usize> From<[KeyValue; N]> for Value {
+    #[inline]
+    fn from(value: [KeyValue; N]) -> Self {
+        Self::ArrayKv(Vec::from(value))
     }
 }
 
-impl From<&Arc<str>> for Value {
-    fn from(value: &Arc<str>) -> Self {
-        Self::String(Str::from(value))
+impl<const N: usize> From<&[KeyValue; N]> for Value {
+    #[inline]
+    fn from(value: &[KeyValue; N]) -> Self {
+        Self::ArrayKv(value.to_vec())
     }
 }
 
-impl From<Cow<'static, str>> for Value {
-    fn from(value: Cow<'static, str>) -> Self {
-        Self::String(Str::from(value))
+impl<const N: usize> From<[u8; N]> for Value {
+    #[inline]
+    fn from(value: [u8; N]) -> Self {
+        Self::Bytes(Vec::from(value))
     }
 }
 
-impl From<bool> for Value {
-    fn from(value: bool) -> Self {
-        Self::Bool(value)
+impl<const N: usize> From<&[u8; N]> for Value {
+    #[inline]
+    fn from(value: &[u8; N]) -> Self {
+        Self::Bytes(value.to_vec())
     }
 }
 
-impl From<i64> for Value {
-    fn from(value: i64) -> Self {
-        Self::Int(value)
+impl_value_int_from!(i64, i8, i16, i32, u8, u16, u32,);
+
+impl_value_double_from!(
+    f64 => std::convert::identity,
+    f32 => f64::from,
+);
+
+impl TryFrom<u64> for Value {
+    type Error = std::num::TryFromIntError;
+
+    #[inline]
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Ok(Self::Int(i64::try_from(value)?))
     }
 }
 
-impl From<f64> for Value {
-    fn from(value: f64) -> Self {
-        Self::Double(value.into())
+impl TryFrom<usize> for Value {
+    type Error = std::num::TryFromIntError;
+
+    #[inline]
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Ok(Self::Int(i64::try_from(value)?))
     }
 }
 
@@ -165,17 +251,39 @@ pub struct KeyValue {
     pub value: Option<Value>,
 }
 
-impl From<&KeyValue> for KeyValue {
-    fn from(value: &KeyValue) -> Self {
-        value.clone()
+impl KeyValue {
+    #[inline(always)]
+    pub fn new(key: impl Into<Str>, value: impl Into<Value>) -> Self {
+        Self {
+            key: key.into(),
+            value: Some(value.into()),
+        }
+    }
+
+    #[inline(always)]
+    pub fn no_val(key: impl Into<Str>) -> Self {
+        Self {
+            key: key.into(),
+            value: None,
+        }
     }
 }
 
-impl From<&&KeyValue> for KeyValue {
-    fn from(value: &&KeyValue) -> Self {
-        (*value).clone()
+impl<K, V> From<(K, V)> for KeyValue
+where
+    K: Into<Str>,
+    V: Into<Value>,
+{
+    #[inline]
+    fn from((key, value): (K, V)) -> Self {
+        Self::new(key, value)
     }
 }
+
+impl_from!(KeyValue;
+    &KeyValue => |value| value.clone(),
+    &&KeyValue => |value| (*value).clone(),
+);
 
 impl From<Str> for String {
     fn from(s: Str) -> Self {
@@ -189,81 +297,17 @@ impl From<Str> for String {
     }
 }
 
-impl From<Value> for pb::any_value::Value {
-    fn from(v: Value) -> Self {
-        match v {
-            Value::String(s) => pb::any_value::Value::StringValue(s.into()),
-            Value::Bool(b) => pb::any_value::Value::BoolValue(b),
-            Value::Int(i) => pb::any_value::Value::IntValue(i),
-            Value::Double(d) => pb::any_value::Value::DoubleValue(d.0),
-            Value::ArrayAny(arr) => pb::any_value::Value::ArrayValue(pb::ArrayValue {
-                values: arr
-                    .into_iter()
-                    .map(|v| pb::AnyValue {
-                        value: Some(v.into()),
-                    })
-                    .collect(),
-            }),
-            Value::ArrayKv(kvs) => pb::any_value::Value::KvlistValue(pb::KeyValueList {
-                values: kvs.into_iter().map(Into::into).collect(),
-            }),
-            Value::Bytes(b) => pb::any_value::Value::BytesValue(b),
-        }
-    }
-}
-
-impl From<Value> for pb::AnyValue {
-    fn from(v: Value) -> Self {
-        pb::AnyValue {
-            value: Some(v.into()),
-        }
-    }
-}
-
-impl From<KeyValue> for pb::KeyValue {
-    fn from(kv: KeyValue) -> Self {
-        pb::KeyValue {
-            key: kv.key.into(),
-            value: kv.value.map(|v| v.into()),
-            key_strindex: 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct AttrIdentity {
-    kvs: Vec<KeyValue>,
-}
-
-impl<I, T> From<I> for AttrIdentity
-where
-    I: IntoIterator<Item = T>,
-    KeyValue: From<T>,
-{
-    fn from(value: I) -> Self {
-        let mut kvs = value.into_iter().map(Into::into).collect::<Vec<KeyValue>>();
-        kvs.sort_unstable();
-        kvs.dedup();
-        Self { kvs }
-    }
+pub enum Temporality {
+    Cumulative,
+    Delta,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct NameIdentity {
-    name: Str,
-    description: Str,
-    unit: Str,
-}
-
-#[derive(Debug)]
-pub struct BucketMap<T>
-where
-    T: AtomicMeasure,
-    T::Type: AtomicNumOps<T>,
-{
-    map: RwLock<HashMap<AttrIdentity, Arc<T>>>,
-    no_attr: T,
-    count: AtomicUsize,
+    pub name: Str,
+    pub description: Str,
+    pub unit: Str,
 }
 
 #[cfg(test)]
@@ -271,17 +315,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn id1() {
-        let kv1 = KeyValue {
-            key: "k1".into(),
-            value: Some("v1".into()),
-        };
+    fn api() {
+        let _ = KeyValue::no_val("foo");
+        let _ = KeyValue::new("foo", "bar");
 
-        let kv2 = KeyValue {
-            key: "k2".into(),
-            value: Some(Value::String("v2".into())),
-        };
+        let s = "foobar".to_owned();
+        let _ = KeyValue::new("a", &s);
 
-        let _ = AttrIdentity::from([&kv1, &kv2]);
+        let _ = KeyValue::new("a", 12i32);
     }
 }
