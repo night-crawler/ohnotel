@@ -180,16 +180,17 @@ where
         buf.sort_unstable();
         buf.dedup();
 
+        let needs_alias = buf.as_slice() != attrs;
+
         // Since the hash is commutative, if the length is the same, it should remain the same
         // after sorting.
-        let (canon_hash, alias) = if buf.len() != raw_fp.len as usize {
-            (
-                AttrFingerprint::commutative_hash(&buf, &self.hasher).table_hash(&self.hasher),
-                Some(Arc::new(raw_fp)),
-            )
+        let canon_hash = if buf.len() != raw_fp.len as usize {
+            AttrFingerprint::commutative_hash(&buf, &self.hasher).table_hash(&self.hasher)
         } else {
-            (raw_hash, None)
+            raw_hash
         };
+
+        let alias = needs_alias.then(|| Arc::new(raw_fp));
 
         let bucket = self.insert_canon(buf, canon_hash, alias.as_ref());
         if let Some(alias) = alias {
@@ -270,11 +271,21 @@ where
 
     #[inline]
     pub fn add(&self, value: T, attrs: &[KeyValue]) {
+        if attrs.is_empty() {
+            self.no_attr_entry.bucket.add(value);
+            return;
+        }
+
         self.get_or_create(attrs).add(value);
     }
 
     #[inline]
     pub fn sub(&self, value: T, attrs: &[KeyValue]) {
+        if attrs.is_empty() {
+            self.no_attr_entry.bucket.sub(value);
+            return;
+        }
+
         self.get_or_create(attrs).sub(value);
     }
 
