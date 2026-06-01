@@ -159,11 +159,24 @@ where
         let raw_fp = AttrFingerprint::commutative_hash(attrs, &self.hasher);
         let raw_hash = raw_fp.table_hash(&self.hasher);
 
-        if let Some(bucket) = self.lookup_canon(raw_hash, attrs) {
+        if attrs.len() == 1 {
+            let Some(bucket) = self.lookup_canon(raw_hash, attrs) else {
+                return Err((raw_fp, raw_hash));
+            };
             return Ok(bucket);
         }
 
-        if let Some(bucket) = self.lookup_dup(&raw_fp) {
+        if attrs.is_sorted() {
+            if let Some(bucket) = self
+                .lookup_canon(raw_hash, attrs)
+                .or_else(|| self.lookup_dup(&raw_fp))
+            {
+                return Ok(bucket);
+            }
+        } else if let Some(bucket) = self
+            .lookup_dup(&raw_fp)
+            .or_else(|| self.lookup_canon(raw_hash, attrs))
+        {
             return Ok(bucket);
         }
 
@@ -380,11 +393,17 @@ where
 {
     #[inline]
     pub fn reset(&self, attrs: &[KeyValue]) -> T {
+        if attrs.is_empty() {
+            return self.no_attr_entry.bucket.reset();
+        }
         self.get_or_create(attrs).reset()
     }
 
     #[inline]
     pub fn set(&self, value: T, attrs: &[KeyValue]) {
+        if attrs.is_empty() {
+            return self.no_attr_entry.bucket.store(value);
+        }
         self.get_or_create(attrs).store(value);
     }
 
